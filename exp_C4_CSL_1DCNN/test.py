@@ -1,0 +1,78 @@
+# test.py
+import torch
+import numpy as np
+import json
+import os
+import time
+from dataset import get_loaders
+from model import Simple1DCNN
+from config import DEVICE, OUTPUT_DIR
+from utils import set_seed, load_checkpoint, compute_metrics, compute_model_complexity
+
+def test(model, loader, device):
+    model.eval()
+    all_preds = []
+    all_labels = []
+    all_confidences = []
+    inference_times = []
+    with torch.no_grad():
+        for inputs, labels in loader:          # 原始信号数据集返回 (signal, label)
+            inputs = inputs.to(device)
+            start_time = time.time()
+            outputs = model(inputs)
+            end_time = time.time()
+            inference_times.append((end_time - start_time) / inputs.size(0))
+            probs = torch.softmax(outputs, dim=1)
+            confidences = probs.max(dim=1)[0].cpu().numpy()
+            preds = outputs.argmax(dim=1).cpu().numpy()
+            all_preds.extend(preds)
+            all_labels.extend(labels.numpy())
+            all_confidences.extend(confidences)
+    avg_inference_time = np.mean(inference_times) * 1000
+    return np.array(all_preds), np.array(all_labels), np.array(all_confidences), avg_inference_time
+
+def main():
+    set_seed()
+    device = torch.device(DEVICE if torch.cuda.is_available() else 'cpu')
+    _, _, test_loader, _ = get_loaders()          # 确保该函数返回原始信号测试集 DataLoader
+    if test_loader is None:
+        print("No test loader. Please check dataset path.")
+        return
+
+    model = Simple1DCNN(num_classes=9).to(device)
+    checkpoint_path = os.path.join(OUTPUT_DIR, 'best_model.pth')
+    if os.path.exists(checkpoint_path):
+        load_checkpoint(model, None, checkpoint_path)
+        print("Loaded best model from", checkpoint_path)
+    else:
+        print("No trained model found, please run train.py first.")
+        return
+
+    flops, params = compute_model_complexity(model, input_size=(1, 512), device=device)
+    y_pred, y_true, confidences, avg_time = test(model, test_loader, device)
+    metrics = compute_metrics(y_true, y_pred)
+    metrics['flops'] = flops
+    metrics['params'] = params
+    metrics['avg_inference_time_ms'] = avg_time
+    metrics['confidence_mean'] = float(np.mean(confidences))
+    metrics['confidence_std'] = float(np.std(confidences))
+
+    with open(os.path.join(OUTPUT_DIR, 'test_metrics.json'), 'w') as f:
+        json.dump(metrics, f, indent=4)
+
+    np.save(os.path.join(OUTPUT_DIR, 'confusion_matrix.npy'), np.array(metrics['confusion_matrix']))
+    np.save(os.path.join(OUTPUT_DIR, 'confidences.npy'), confidences)
+    np.save(os.path.join(OUTPUT_DIR, 'labels.npy'), y_true)
+
+    print("\n=== Test Results ===")
+    print(f"Overall Accuracy: {metrics['overall_acc']:.4f}")
+    print(f"Macro F1: {metrics['macro_f1']:.4f}")
+    print(f"G-Mean: {metrics['g_mean']:.4f}")
+    print(f"Fault Avg Recall: {metrics['fault_avg_recall']:.4f}")
+    print(f"Recall Std: {metrics['recall_std']:.4f}")
+    print(f"FLOPs: {flops}, Params: {params}")
+    print(f"Avg Inference Time: {avg_time:.2f} ms/sample")
+    print(f"Confidence: mean={metrics['confidence_mean']:.4f}, std={metrics['confidence_std']:.4f}")
+
+if __name__ == "__main__":
+    main()
